@@ -6,6 +6,10 @@
 
 <b>LLM inference in C/C++</b>
 
+> **SenseNova-Loop MTP fork.** This branch adds MTP export/runtime support
+> for SenseNova-Loop on top of `GuideboardLabs/llama.cpp-sensenova-loop`.
+> See [SENSENOVA-MTP.md](SENSENOVA-MTP.md) for build and run instructions.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
 [![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)

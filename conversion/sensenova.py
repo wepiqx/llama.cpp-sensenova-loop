@@ -12,7 +12,8 @@ The mHC routers (`mhc`) are per-sublayer, not per-layer: `mhc_attn` and `mhc_ffn
 projection of width 2*streams*dim -> 2*streams + streams^2, and the sublayer runs once on the
 pre-weighted sum of the residual streams. Those tensors go into the file untouched and stay fp32.
 
-Vision and the MTP head are dropped: this GGUF is text-only.
+The vision tower is dropped. The MTP head is exported as the single nextn block
+after the virtual loop blocks (disable with --no-mtp).
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ def mhc_kinds(plan: list[int], mhc: dict | None) -> list[int]:
 @ModelBase.register("SenseNovaLoopForConditionalGeneration", "SenseNovaLoopModel")
 class SenseNovaLoopModel(Qwen3_5TextModel):
     model_arch = gguf.MODEL_ARCH.SENSENOVA_LOOP
-    no_mtp = True
+    supports_mtp_export = True
 
     def __init__(self, dir_model, *args, **kwargs):
         super().__init__(dir_model, *args, **kwargs)
@@ -86,45 +87,95 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
         self.mhc = mhc
         self.kinds = mhc_kinds(self.plan, mhc)
         self.n_virtual = len(self.plan)
+        self.n_phys = n_phys
 
         self.virtual_for: dict[int, list[int]] = {}
         for v, p in enumerate(self.plan):
             self.virtual_for.setdefault(p, []).append(v)
 
-        # the file describes the expanded plan, so the block count and name map follow it
-        self.block_count = self.n_virtual
+        # the file describes the expanded plan, so the block count and name map follow it.
+        # MTP (if present) is stored as the next dense layer after the last virtual block.
+        self.n_mtp = 0 if self.no_mtp else 1
+        self.block_count = self.n_virtual + self.n_mtp
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
         logger.info(f"loop plan: {n_phys} physical layers -> {self.n_virtual} blocks, "
-                    f"mHC on {sum(1 for k in self.kinds if k)} of them")
+                    f"mHC on {sum(1 for k in self.kinds if k)} of them, MTP layers: {self.n_mtp}")
 
     def set_gguf_parameters(self):
         # the base writes the recurrent-layer array from the physical layer types; this file
         # describes the expanded plan, so suppress it and write the array for the plan instead
         layer_types = self.hparams.pop("layer_types", None)
+        # the qwen MTP mixin would derive nextn layers from block_count - physical layers,
+        # which is wrong for a loop-expanded file; suppress it and write the real count below
+        no_mtp_save = self.no_mtp
+        self.no_mtp = True
         try:
             super().set_gguf_parameters()
         finally:
+            self.no_mtp = no_mtp_save
             if layer_types is not None:
                 self.hparams["layer_types"] = layer_types
 
         if layer_types is not None:
-            self.gguf_writer.add_recurrent_layers([layer_types[p] == "linear_attention" for p in self.plan])
+            # MTP layers are dense attention-only and must be flagged non-recurrent
+            self.gguf_writer.add_recurrent_layers(
+                [layer_types[p] == "linear_attention" for p in self.plan] + [False] * self.n_mtp)
+
+        if self.n_mtp:
+            self.gguf_writer.add_nextn_predict_layers(self.n_mtp)
 
         if self.mhc:
             arch = self.gguf_writer.arch
             streams = int(self.mhc["streams"])
             self.gguf_writer.add_uint32(gguf.Keys.MHC.STREAMS.format(arch=arch), streams)
-            self.gguf_writer.add_array(gguf.Keys.MHC.LAYER_KINDS.format(arch=arch), self.kinds)
+            self.gguf_writer.add_array(gguf.Keys.MHC.LAYER_KINDS.format(arch=arch),
+                                       self.kinds + [0] * self.n_mtp)
             logger.info(f"mHC: {streams} streams, {int(self.mhc['iterations'])} sinkhorn iterations")
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name.startswith("model.visual.") or name.startswith("mtp."):
-            return  # text-only: vision tower and the MTP head stay out of this file
+        if name.startswith("model.visual."):
+            return  # text-only: the vision tower stays out of this file
+        if name.startswith("model.mtp."):
+            name = name.replace("model.", "", 1)
+        if name.startswith("mtp."):
+            if self.n_mtp == 0:
+                return
+            remap = {
+                "fc":                    "eh_proj",
+                "pre_fc_norm_embedding": "enorm",
+                "pre_fc_norm_hidden":    "hnorm",
+                "norm":                  "shared_head.norm",
+            }
+            if name.startswith("mtp.layers."):
+                parts = name.split(".", 3)
+                if len(parts) != 4 or not parts[2].isdigit():
+                    raise ValueError(f"unexpected MTP tensor name: {name}")
+                idx = int(parts[2])
+                if idx >= self.n_mtp:
+                    raise ValueError(f"MTP layer {idx} exceeds declared count {self.n_mtp}")
+                v = self.n_virtual + idx
+                yield from super().modify_tensors(data_torch, f"model.layers.{v}.{parts[3]}", v)
+                return
+            m = re.match(r"mtp\.(fc|pre_fc_norm_embedding|pre_fc_norm_hidden|norm)\.(.+)$", name)
+            if not m:
+                raise ValueError(f"unexpected MTP tensor name: {name}")
+            v = self.n_virtual
+            yield from super().modify_tensors(
+                data_torch, f"model.layers.{v}.{remap[m.group(1)]}.{m.group(2)}", v)
+            return
 
         m = re.match(r"model\.(?:language_model\.)?layers\.(\d+)\.(.+)$", name)
         if m:
             phys, tail = int(m.group(1)), m.group(2)
+            if phys >= self.n_phys:
+                # the qwen MTP mixin renames mtp.layers.<i> to model.layers.<n_phys+i>;
+                # move it past the virtual loop blocks, where the runtime expects the draft head
+                v = self.n_virtual + (phys - self.n_phys)
+                if v >= self.block_count:
+                    raise ValueError(f"MTP layer {phys} exceeds declared block count {self.block_count}")
+                yield from super().modify_tensors(data_torch, f"model.layers.{v}.{tail}", v)
+                return
             if tail.endswith("conv1d.weight"):
                 # ssm_conv reads an F32 kernel, so this one is never narrowed
                 data_torch = data_torch.to(torch.float32)
