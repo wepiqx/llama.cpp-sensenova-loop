@@ -133,7 +133,15 @@ class SenseNovaLoopModel(Qwen3_5TextModel):
                                        self.kinds + [0] * self.n_mtp)
             logger.info(f"mHC: {streams} streams, {int(self.mhc['iterations'])} sinkhorn iterations")
 
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if new_name.endswith(("mhc_attn.weight", "mhc_ffn.weight")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith("loop_gate.logits"):
+            logger.warning("dropping release-only loop_gate.logits buffer")
+            return
         if name.startswith("model.visual."):
             return  # text-only: the vision tower stays out of this file
         if name.startswith("model.mtp."):
